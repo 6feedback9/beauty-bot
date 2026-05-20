@@ -1,90 +1,163 @@
 # -*- coding: utf-8 -*-
 """
-Бот для beauty-гайда: подбор ухода за кожей.
-Клиентка выбирает тариф, проходит анкету, загружает фото,
-заявка уходит заказчице в личку.
+Beauty Guide — бот подписки на закрытый Telegram-канал.
 
-Технологии: Python + aiogram 3 + aiohttp (webhook для Render).
+Логика:
+  девочка заходит -> читает о заказчице и FAQ ->
+  оформляет подписку (оплата WayForPay) ->
+  бот выдаёт персональную ссылку в закрытый канал ->
+  через 30 дней подписка истекает, бот убирает её из канала.
+
+Технологии: Python + aiogram 3 + aiohttp (webhook) + SQLite (база подписок).
 """
 
 import os
+import hmac
+import hashlib
 import logging
+import sqlite3
+import time
+import asyncio
+from datetime import datetime, timedelta
+
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, CallbackQuery, FSInputFile,
+    Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ============================================================
-# НАСТРОЙКИ — берутся из переменных окружения на Render
+# НАСТРОЙКИ — из переменных окружения на Render
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")          # токен от BotFather
-ADMIN_ID = os.getenv("ADMIN_ID")            # Telegram ID заказчицы (число)
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")    # адрес сервиса на Render, напр. https://beauty-bot.onrender.com
+BOT_TOKEN = os.getenv("BOT_TOKEN")              # токен от BotFather
+ADMIN_ID = os.getenv("ADMIN_ID")                # Telegram ID заказчицы
+CHANNEL_ID = os.getenv("CHANNEL_ID")            # ID закрытого канала, напр. -1001234567890
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")        # адрес сервиса на Render
+
+# WayForPay — ключи мерчанта от заказчицы
+WFP_MERCHANT = os.getenv("WFP_MERCHANT")        # merchantAccount
+WFP_SECRET = os.getenv("WFP_SECRET")            # merchantSecretKey
+
+# Параметры подписки
+SUB_PRICE = os.getenv("SUB_PRICE", "300")       # цена в гривнах
+SUB_DAYS = int(os.getenv("SUB_DAYS", "30"))     # длительность подписки в днях
+
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-PORT = int(os.getenv("PORT", 10000))        # Render сам подставляет PORT
+# отдельный адрес, на который WayForPay присылает подтверждение оплаты
+WFP_CALLBACK_PATH = "/wayforpay-callback"
+PORT = int(os.getenv("PORT", 10000))
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
+
+DB_PATH = "subscriptions.db"
+
 
 # ============================================================
-# ТАРИФЫ — редактируй текст и цены под себя
+# БАЗА ДАННЫХ — хранит, кто и до какого числа подписан
 # ============================================================
-TARIFFS = {
-    "express": {
-        "name": "Экспресс-разбор",
-        "price": "300 грн",
-        "desc": (
-            "Анализ средств, которыми ты уже пользуешься. "
-            "Скажу, что работает, что лишнее, чего не хватает.\n"
-            "Срок выполнения: 1–2 дня."
-        ),
-    },
-    "full": {
-        "name": "Полный разбор",
-        "price": "600 грн",
-        "desc": (
-            "Разбор текущего ухода + подбор новой рутины под твою кожу: "
-            "утро/вечер, конкретные средства и порядок нанесения.\n"
-            "Срок выполнения: 2–3 дня."
-        ),
-    },
-    "vip": {
-        "name": "VIP-разбор",
-        "price": "1200 грн",
-        "desc": (
-            "Полный разбор + видеоконсультация + сопровождение 2 недели: "
-            "можешь задавать вопросы по ходу.\n"
-            "Срок выполнения: 3–4 дня."
-        ),
-    },
-}
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subs (
+            user_id    INTEGER PRIMARY KEY,
+            username   TEXT,
+            full_name  TEXT,
+            expires_at INTEGER,   -- метка времени окончания подписки
+            active     INTEGER    -- 1 = в канале, 0 = удалён
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def db_set_subscription(user_id, username, full_name, expires_at):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        INSERT INTO subs (user_id, username, full_name, expires_at, active)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            full_name=excluded.full_name,
+            expires_at=excluded.expires_at,
+            active=1
+    """, (user_id, username, full_name, expires_at))
+    conn.commit()
+    conn.close()
+
+
+def db_get_expired():
+    """Возвращает тех, у кого подписка кончилась, но они ещё числятся активными."""
+    now = int(time.time())
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT user_id FROM subs WHERE expires_at < ? AND active = 1", (now,)
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def db_deactivate(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE subs SET active = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_get_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT expires_at, active FROM subs WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row  # (expires_at, active) или None
+
 
 # ============================================================
-# СОСТОЯНИЯ АНКЕТЫ (FSM — пошаговый сбор данных)
+# ТЕКСТЫ
 # ============================================================
-class Survey(StatesGroup):
-    skin_type = State()      # тип кожи
-    age = State()            # возраст
-    problems = State()       # проблемы кожи
-    allergy = State()        # аллергии
-    budget = State()         # бюджет на уход
-    city = State()           # город
-    photo_face = State()     # фото лица
-    photo_products = State() # фото средств
-    phone = State()          # телефон
+ABOUT_TEXT = (
+    "<b>Обо мне и моём Beauty Guide</b>\n\n"
+    "11 лет назад я сделала первые шаги в индустрии красоты — тогда ещё "
+    "не зная, что это станет важной частью моей жизни.\n\n"
+    "За эти годы я работала моделью для салонов, участвовала в показах "
+    "и съёмках, стала амбассадором брендов и партнёром мастеров, которым "
+    "действительно доверяю.\n\n"
+    "Свой Beauty Guide я создала как пространство, где делюсь опытом, "
+    "любимыми находками и помогаю женщинам раскрывать свою красоту "
+    "каждый день. И спустя 11 лет я понимаю — это только начало 🤍"
+)
+
+WELCOME_TEXT = (
+    "Добро пожаловать в твой личный <b>Beauty Guide</b>! 🤍\n\n"
+    "Здесь я делюсь любимыми средствами, проверенными процедурами "
+    "и находками по уходу за кожей, волосами и телом.\n\n"
+    "Контент регулярно обновляется — чтобы у тебя всегда были свежие "
+    "идеи, вдохновение и новые beauty-находки.\n\n"
+    "Оформи подписку и получи доступ к закрытому каналу 👇"
+)
+
+FAQ_TEXT = (
+    "<b>Частые вопросы</b>\n\n"
+    "<b>Что я получу по подписке?</b>\n"
+    "Доступ к закрытому каналу с моими постами: уход за кожей, волосами "
+    "и телом, любимые средства, процедуры и находки.\n\n"
+    "<b>Сколько стоит и на какой срок?</b>\n"
+    f"{SUB_PRICE} грн за {SUB_DAYS} дней доступа.\n\n"
+    "<b>Что будет, когда подписка закончится?</b>\n"
+    "Доступ к каналу закроется автоматически. Чтобы продолжить — просто "
+    "оформи подписку снова.\n\n"
+    "<b>Как оплатить?</b>\n"
+    "Картой онлайн через защищённую систему WayForPay прямо из бота."
+)
 
 
 # ============================================================
@@ -92,277 +165,258 @@ class Survey(StatesGroup):
 # ============================================================
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Услуги и цены", callback_data="services")],
-        [InlineKeyboardButton(text="📝 Записаться на разбор", callback_data="order")],
+        [InlineKeyboardButton(text="💳 Оформить подписку", callback_data="subscribe")],
+        [InlineKeyboardButton(text="✨ О Beauty Guide", callback_data="about")],
         [InlineKeyboardButton(text="❓ Частые вопросы", callback_data="faq")],
+        [InlineKeyboardButton(text="🔑 Моя подписка", callback_data="my_sub")],
     ])
 
 
-def tariffs_kb() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(
-            text=f"{t['name']} — {t['price']}",
-            callback_data=f"choose_{key}"
-        )]
-        for key, t in TARIFFS.items()
-    ]
-    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="to_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def skin_type_kb() -> InlineKeyboardMarkup:
-    types = ["Сухая", "Жирная", "Комбинированная", "Нормальная", "Не знаю"]
+def back_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=f"skin_{t}")] for t in types
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="to_menu")]
     ])
-
-
-def phone_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Отправить мой номер", request_contact=True)]],
-        resize_keyboard=True, one_time_keyboard=True,
-    )
 
 
 # ============================================================
-# СТАРТ И МЕНЮ
+# WAYFORPAY — формирование ссылки на оплату
+# ============================================================
+def make_payment_link(user_id: int) -> str:
+    """
+    Создаёт ссылку на оплату WayForPay.
+
+    Пока WFP_MERCHANT / WFP_SECRET не заданы — возвращает пустую строку
+    (бот работает в режиме без оплаты, для теста логики).
+
+    Когда заказчица получит ключи мерчанта и впишет их в переменные —
+    функцию нужно будет дополнить полем invoice по документации WayForPay.
+    """
+    if not WFP_MERCHANT or not WFP_SECRET:
+        return ""  # режим заглушки
+
+    # ЗАГОТОВКА. Реальная интеграция WayForPay делается через их Invoice API.
+    # Здесь формируется подпись запроса; конкретные поля добавим по докам
+    # WayForPay, когда будут ключи.
+    order_ref = f"sub-{user_id}-{int(time.time())}"
+    # подпись (пример структуры — уточняется по документации WayForPay)
+    sign_str = ";".join([WFP_MERCHANT, order_ref, SUB_PRICE])
+    signature = hmac.new(
+        WFP_SECRET.encode(), sign_str.encode(), hashlib.md5
+    ).hexdigest()
+    logging.info(f"WayForPay order {order_ref}, signature {signature}")
+    # вернётся реальная ссылка на оплату после доработки интеграции
+    return ""
+
+
+# ============================================================
+# КОМАНДЫ И МЕНЮ
 # ============================================================
 @dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "Привет! 🌿\n\n"
-        "Это бот по подбору ухода за кожей. "
-        "Здесь ты можешь записаться на персональный разбор: "
-        "я посмотрю, чем ты пользуешься, и подберу то, что подойдёт именно тебе.\n\n"
-        "С чего начнём?",
-        reply_markup=main_menu(),
-    )
+async def cmd_start(message: Message):
+    await message.answer(WELCOME_TEXT, reply_markup=main_menu())
 
 
 @dp.callback_query(F.data == "to_menu")
-async def to_menu(call: CallbackQuery, state: FSMContext):
-    await state.clear()
+async def to_menu(call: CallbackQuery):
     await call.message.answer("Главное меню:", reply_markup=main_menu())
     await call.answer()
 
 
-@dp.callback_query(F.data == "services")
-async def show_services(call: CallbackQuery):
-    text = "<b>Услуги и цены:</b>\n\n"
-    for t in TARIFFS.values():
-        text += f"<b>{t['name']} — {t['price']}</b>\n{t['desc']}\n\n"
-    await call.message.answer(text, reply_markup=tariffs_kb())
+@dp.callback_query(F.data == "about")
+async def show_about(call: CallbackQuery):
+    await call.message.answer(ABOUT_TEXT, reply_markup=back_kb())
     await call.answer()
 
 
 @dp.callback_query(F.data == "faq")
 async def show_faq(call: CallbackQuery):
-    await call.message.answer(
-        "<b>Частые вопросы</b>\n\n"
-        "<b>Как проходит разбор?</b>\n"
-        "Ты заполняешь анкету и присылаешь фото. Я анализирую и присылаю "
-        "результат текстом, а для VIP — видео.\n\n"
-        "<b>Нужно ли фото без макияжа?</b>\n"
-        "Да, так я точнее оценю состояние кожи.\n\n"
-        "<b>Сколько ждать результат?</b>\n"
-        "От 1 до 4 дней в зависимости от тарифа.\n\n"
-        "<b>Можно ли задать вопрос после разбора?</b>\n"
-        "Да, особенно на VIP-тарифе — там сопровождение 2 недели.",
-        reply_markup=main_menu(),
-    )
+    await call.message.answer(FAQ_TEXT, reply_markup=back_kb())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "my_sub")
+async def show_my_sub(call: CallbackQuery):
+    row = db_get_user(call.from_user.id)
+    if row and row[1] == 1:
+        expires = datetime.fromtimestamp(row[0]).strftime("%d.%m.%Y")
+        text = (
+            "🔑 <b>Твоя подписка активна</b>\n\n"
+            f"Доступ к каналу открыт до <b>{expires}</b>.\n"
+            "После этой даты доступ закроется — продлить можно будет здесь же."
+        )
+    else:
+        text = (
+            "У тебя пока нет активной подписки.\n\n"
+            "Оформи её, чтобы попасть в закрытый Beauty Guide 🤍"
+        )
+    await call.message.answer(text, reply_markup=main_menu())
     await call.answer()
 
 
 # ============================================================
-# НАЧАЛО АНКЕТЫ
+# ОФОРМЛЕНИЕ ПОДПИСКИ
 # ============================================================
-@dp.callback_query(F.data == "order")
-async def start_order(call: CallbackQuery):
-    await call.message.answer("Выбери тариф:", reply_markup=tariffs_kb())
+@dp.callback_query(F.data == "subscribe")
+async def subscribe(call: CallbackQuery):
+    pay_link = make_payment_link(call.from_user.id)
+
+    if pay_link:
+        # рабочий режим: есть ссылка на оплату WayForPay
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить", url=pay_link)],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="to_menu")],
+        ])
+        await call.message.answer(
+            f"<b>Подписка на Beauty Guide</b>\n\n"
+            f"Стоимость: {SUB_PRICE} грн\n"
+            f"Срок доступа: {SUB_DAYS} дней\n\n"
+            "Нажми «Оплатить» — после оплаты бот сразу пришлёт ссылку "
+            "на закрытый канал.",
+            reply_markup=kb,
+        )
+    else:
+        # режим заглушки: оплата ещё не подключена
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Я оплатила (тестовый режим)",
+                callback_data="test_paid"
+            )],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="to_menu")],
+        ])
+        await call.message.answer(
+            f"<b>Подписка на Beauty Guide</b>\n\n"
+            f"Стоимость: {SUB_PRICE} грн\n"
+            f"Срок доступа: {SUB_DAYS} дней\n\n"
+            "⚠️ Оплата WayForPay ещё подключается. Пока кнопка ниже "
+            "выдаёт доступ без оплаты — это для проверки работы бота.",
+            reply_markup=kb,
+        )
     await call.answer()
 
 
-@dp.callback_query(F.data.startswith("choose_"))
-async def choose_tariff(call: CallbackQuery, state: FSMContext):
-    key = call.data.replace("choose_", "")
-    tariff = TARIFFS[key]
-    await state.update_data(tariff=tariff["name"], tariff_price=tariff["price"])
-    await call.message.answer(
-        f"Отлично, ты выбрала <b>{tariff['name']}</b> ({tariff['price']}).\n\n"
-        "Теперь несколько вопросов, чтобы разбор был точным.\n\n"
-        "<b>1/9.</b> Какой у тебя тип кожи?",
-        reply_markup=skin_type_kb(),
-    )
-    await state.set_state(Survey.skin_type)
+@dp.callback_query(F.data == "test_paid")
+async def test_paid(call: CallbackQuery):
+    """Тестовая выдача доступа без оплаты — удалить, когда подключится WayForPay."""
+    await grant_access(call.from_user.id, call.from_user.username,
+                       call.from_user.full_name)
     await call.answer()
 
 
-@dp.callback_query(Survey.skin_type, F.data.startswith("skin_"))
-async def get_skin(call: CallbackQuery, state: FSMContext):
-    await state.update_data(skin_type=call.data.replace("skin_", ""))
-    await call.message.answer("<b>2/9.</b> Сколько тебе лет? (просто число)")
-    await state.set_state(Survey.age)
-    await call.answer()
-
-
-@dp.message(Survey.age)
-async def get_age(message: Message, state: FSMContext):
-    await state.update_data(age=message.text)
-    await message.answer(
-        "<b>3/9.</b> Какие проблемы кожи тебя беспокоят?\n"
-        "Опиши своими словами: высыпания, сухость, жирный блеск, "
-        "пигментация, покраснения, расширенные поры и т.д."
-    )
-    await state.set_state(Survey.problems)
-
-
-@dp.message(Survey.problems)
-async def get_problems(message: Message, state: FSMContext):
-    await state.update_data(problems=message.text)
-    await message.answer(
-        "<b>4/9.</b> Есть ли аллергии или непереносимость каких-то компонентов?\n"
-        "Если нет — напиши «нет»."
-    )
-    await state.set_state(Survey.allergy)
-
-
-@dp.message(Survey.allergy)
-async def get_allergy(message: Message, state: FSMContext):
-    await state.update_data(allergy=message.text)
-    await message.answer(
-        "<b>5/9.</b> Какой примерный бюджет на уход в месяц? "
-        "Это поможет подобрать средства по карману."
-    )
-    await state.set_state(Survey.budget)
-
-
-@dp.message(Survey.budget)
-async def get_budget(message: Message, state: FSMContext):
-    await state.update_data(budget=message.text)
-    await message.answer("<b>6/9.</b> В каком городе ты находишься?")
-    await state.set_state(Survey.city)
-
-
-@dp.message(Survey.city)
-async def get_city(message: Message, state: FSMContext):
-    await state.update_data(city=message.text)
-    await message.answer(
-        "<b>7/9.</b> Пришли фото лица без макияжа. 📸\n"
-        "Лучше при дневном свете. Можно одно фото."
-    )
-    await state.set_state(Survey.photo_face)
-
-
-@dp.message(Survey.photo_face, F.photo)
-async def get_photo_face(message: Message, state: FSMContext):
-    # сохраняем file_id самого крупного варианта фото
-    await state.update_data(photo_face=message.photo[-1].file_id)
-    await message.answer(
-        "<b>8/9.</b> Теперь пришли фото средств, которыми пользуешься сейчас. 🧴\n"
-        "Можно одним фото, где всё вместе."
-    )
-    await state.set_state(Survey.photo_products)
-
-
-@dp.message(Survey.photo_face)
-async def photo_face_wrong(message: Message):
-    await message.answer("Пожалуйста, пришли именно фото 📸")
-
-
-@dp.message(Survey.photo_products, F.photo)
-async def get_photo_products(message: Message, state: FSMContext):
-    await state.update_data(photo_products=message.photo[-1].file_id)
-    await message.answer(
-        "<b>9/9.</b> Последний шаг — оставь номер телефона для связи.\n"
-        "Нажми кнопку ниже или впиши номер вручную.",
-        reply_markup=phone_kb(),
-    )
-    await state.set_state(Survey.phone)
-
-
-@dp.message(Survey.photo_products)
-async def photo_products_wrong(message: Message):
-    await message.answer("Пожалуйста, пришли именно фото 🧴")
-
-
-# ============================================================
-# ЗАВЕРШЕНИЕ — отправка заявки заказчице
-# ============================================================
-@dp.message(Survey.phone)
-async def finish_survey(message: Message, state: FSMContext):
-    # телефон может прийти как контакт или как текст
-    phone = message.contact.phone_number if message.contact else message.text
-    await state.update_data(phone=phone)
-    data = await state.get_data()
-
-    user = message.from_user
-    username = f"@{user.username}" if user.username else "без username"
-
-    # текст заявки для заказчицы
-    summary = (
-        "🔔 <b>НОВАЯ ЗАЯВКА НА РАЗБОР</b>\n\n"
-        f"<b>Тариф:</b> {data.get('tariff')} ({data.get('tariff_price')})\n"
-        f"<b>Клиент:</b> {user.full_name} ({username})\n"
-        f"<b>ID:</b> <code>{user.id}</code>\n"
-        f"<b>Телефон:</b> {data.get('phone')}\n\n"
-        f"<b>Тип кожи:</b> {data.get('skin_type')}\n"
-        f"<b>Возраст:</b> {data.get('age')}\n"
-        f"<b>Проблемы:</b> {data.get('problems')}\n"
-        f"<b>Аллергии:</b> {data.get('allergy')}\n"
-        f"<b>Бюджет:</b> {data.get('budget')}\n"
-        f"<b>Город:</b> {data.get('city')}\n\n"
-        "Фото — ниже 👇"
-    )
+async def grant_access(user_id, username, full_name):
+    """Открывает доступ: сохраняет подписку и присылает ссылку в канал."""
+    expires_at = int(time.time()) + SUB_DAYS * 86400
+    db_set_subscription(user_id, username or "", full_name or "", expires_at)
 
     try:
-        await bot.send_message(ADMIN_ID, summary)
-        await bot.send_photo(ADMIN_ID, data.get("photo_face"), caption="Фото лица")
-        await bot.send_photo(ADMIN_ID, data.get("photo_products"), caption="Текущие средства")
+        # одноразовая персональная ссылка-приглашение в закрытый канал
+        invite = await bot.create_chat_invite_link(
+            chat_id=CHANNEL_ID, member_limit=1,
+            name=f"sub {user_id}",
+        )
+        expires = datetime.fromtimestamp(expires_at).strftime("%d.%m.%Y")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔓 Войти в канал", url=invite.invite_link)],
+            [InlineKeyboardButton(text="⬅️ В меню", callback_data="to_menu")],
+        ])
+        await bot.send_message(
+            user_id,
+            "Готово! 🎉\n\n"
+            f"Подписка активна до <b>{expires}</b>.\n"
+            "Нажми кнопку ниже, чтобы войти в закрытый Beauty Guide 🤍\n\n"
+            "Ссылка персональная и работает один раз.",
+            reply_markup=kb,
+        )
+        # уведомление заказчице
+        if ADMIN_ID:
+            uname = f"@{username}" if username else "без username"
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔔 Новая подписка\n{full_name} ({uname})\nдо {expires}"
+            )
     except Exception as e:
-        logging.error(f"Не удалось отправить заявку админу: {e}")
-
-    await message.answer(
-        "Готово! 🎉\n\n"
-        "Твоя заявка принята. Скоро с тобой свяжутся, "
-        "и ты получишь персональный разбор в срок по выбранному тарифу.\n\n"
-        "Спасибо за доверие! 🌿",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await message.answer("Главное меню:", reply_markup=main_menu())
-    await state.clear()
+        logging.error(f"Ошибка выдачи доступа: {e}")
+        await bot.send_message(
+            user_id,
+            "Оплата прошла, но не получилось создать ссылку на канал. "
+            "Напиши, пожалуйста, в поддержку — доступ откроют вручную."
+        )
 
 
-# запасной обработчик — если человек пишет что-то вне сценария
 @dp.message()
 async def fallback(message: Message):
     await message.answer(
-        "Не совсем поняла 🙈 Нажми /start, чтобы открыть меню.",
-        reply_markup=main_menu(),
+        "Нажми /start, чтобы открыть меню 🤍", reply_markup=main_menu()
     )
 
 
 # ============================================================
-# ЗАПУСК ЧЕРЕЗ WEBHOOK (для Render)
+# ФОНОВАЯ ПРОВЕРКА — раз в час убирает тех, у кого подписка истекла
+# ============================================================
+async def check_expired_loop():
+    while True:
+        try:
+            for user_id in db_get_expired():
+                try:
+                    # удаляем из канала и сразу разбаниваем,
+                    # чтобы человек мог вступить снова после новой оплаты
+                    await bot.ban_chat_member(CHANNEL_ID, user_id)
+                    await bot.unban_chat_member(CHANNEL_ID, user_id)
+                    db_deactivate(user_id)
+                    await bot.send_message(
+                        user_id,
+                        "Твоя подписка на Beauty Guide закончилась 🤍\n\n"
+                        "Доступ к каналу закрыт. Чтобы вернуться — "
+                        "оформи подписку снова через /start"
+                    )
+                    logging.info(f"Подписка истекла, удалён: {user_id}")
+                except Exception as e:
+                    logging.error(f"Не удалось удалить {user_id}: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка проверки подписок: {e}")
+        await asyncio.sleep(3600)  # пауза 1 час
+
+
+# ============================================================
+# ОБРАБОТКА ОПЛАТЫ ОТ WAYFORPAY
+# ============================================================
+async def wayforpay_callback(request: web.Request):
+    """
+    Сюда WayForPay присылает подтверждение оплаты.
+    Полная проверка подписи будет добавлена вместе с интеграцией,
+    когда заказчица предоставит ключи мерчанта.
+    """
+    try:
+        data = await request.json()
+        logging.info(f"WayForPay callback: {data}")
+        # TODO: проверить подпись, извлечь user_id из orderReference,
+        #       при успешной оплате вызвать grant_access(...)
+    except Exception as e:
+        logging.error(f"Ошибка callback WayForPay: {e}")
+    return web.json_response({"status": "accept"})
+
+
+# ============================================================
+# ЗАПУСК
 # ============================================================
 async def on_startup(app: web.Application):
+    db_init()
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    logging.info(f"Webhook установлен: {WEBHOOK_URL}")
+    asyncio.create_task(check_expired_loop())
+    logging.info(f"Бот запущен. Webhook: {WEBHOOK_URL}")
 
 
 async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
-    logging.info("Webhook удалён")
 
 
-# простой ответ для проверки, что сервис жив
 async def health(request):
-    return web.Response(text="Bot is running")
+    return web.Response(text="Beauty Guide bot is running")
 
 
 def main():
     app = web.Application()
     app.router.add_get("/", health)
+    app.router.add_post(WFP_CALLBACK_PATH, wayforpay_callback)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
