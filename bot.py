@@ -214,6 +214,8 @@ def back_kb() -> InlineKeyboardMarkup:
 def _hmac_md5(secret: str, parts: list) -> str:
     """HMAC_MD5 от строки параметров, склеенных через ';'."""
     base = ";".join(str(p) for p in parts)
+    # ДИАГНОСТИКА: показываем строку, из которой считается подпись
+    logging.info(f"SIGN STRING >>> {base}")
     return hmac.new(secret.encode("utf-8"),
                     base.encode("utf-8"),
                     hashlib.md5).hexdigest()
